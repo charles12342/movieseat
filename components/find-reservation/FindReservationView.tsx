@@ -13,8 +13,10 @@ import {
   CheckCircle2,
   ChevronRight,
   Film,
+  Loader2,
 } from 'lucide-react';
 import { formatPeso, formatSeatLabel } from '@/lib/booking';
+import { createClient } from '@/lib/supabase/client';
 import CancelReservationModal from './CancelReservationModal';
 
 export interface ReservationSeatItem {
@@ -51,6 +53,21 @@ export interface ReservationItem {
 export type DisplayStatus = 'Active' | 'Cancelled' | 'Expired' | 'Used';
 
 /**
+ * Cleans the reference code lookup input:
+ * 1. Trims leading and trailing whitespace.
+ * 2. Strips all leading '#' characters (whether single, duplicated '##', or separated by spaces).
+ * 3. Converts to uppercase.
+ * Note: '#' is strictly a visual UI prefix and never part of the reference_code search value.
+ */
+export function cleanReferenceCode(input: string): string {
+  return input
+    .trim()
+    .replace(/^[#\s]+/, '')
+    .trim()
+    .toUpperCase();
+}
+
+/**
  * Derives user-facing status from stored database status and screening timestamps.
  * Active, Cancelled (stored) vs Expired, Used (derived from showtime clock).
  */
@@ -78,6 +95,10 @@ interface FindReservationViewProps {
 export default function FindReservationView({ initialReservations }: FindReservationViewProps) {
   const [reservations, setReservations] = useState<ReservationItem[]>(initialReservations);
   const [searchQuery, setSearchQuery] = useState('');
+  const [isSearching, setIsSearching] = useState(false);
+  const [searchMessage, setSearchMessage] = useState<string | null>(null);
+  const [queriedResults, setQueriedResults] = useState<ReservationItem[] | null>(null);
+  const [hasSearched, setHasSearched] = useState(false);
   const [selectedId, setSelectedId] = useState<string>(
     initialReservations[0]?.reservation_id || ''
   );
@@ -86,16 +107,80 @@ export default function FindReservationView({ initialReservations }: FindReserva
   const [cancelError, setCancelError] = useState<string | null>(null);
   const [cancelSuccess, setCancelSuccess] = useState<string | null>(null);
 
-  // Normalize search input by stripping optional # prefix
-  const cleanQuery = searchQuery.trim().replace(/^#/, '').toUpperCase();
+  // Normalize search input: strips all leading '#', trims, converts to uppercase
+  const cleanQuery = useMemo(() => cleanReferenceCode(searchQuery), [searchQuery]);
 
-  // Filter reservations matching search query
+  // Handles lookup execution against my_reservations
+  const handleSearch = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    setSearchMessage(null);
+
+    const cleaned = cleanReferenceCode(searchQuery);
+
+    // Rule 4: If the cleaned value is empty, show a friendly message and do not query.
+    if (!cleaned) {
+      setSearchMessage('Please enter a booking reference code to search.');
+      setQueriedResults(null);
+      setHasSearched(false);
+      return;
+    }
+
+    // Rule 3: Search my_reservations by reference_code using the cleaned value, for example MS-2026-A4F92B.
+    setIsSearching(true);
+    setHasSearched(true);
+
+    try {
+      const supabase = createClient();
+      const { data, error } = await supabase
+        .from('my_reservations')
+        .select('*')
+        .or(`reference_code.eq.${cleaned},reference_code.ilike.%${cleaned}%`)
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        console.error('[my_reservations search error]', error.message);
+        const localMatches = reservations.filter((r) =>
+          r.reference_code.toUpperCase().includes(cleaned)
+        );
+        setQueriedResults(localMatches);
+        if (localMatches.length > 0) {
+          setSelectedId(localMatches[0].reservation_id);
+        }
+      } else {
+        const found = (data || []) as unknown as ReservationItem[];
+        setQueriedResults(found);
+
+        if (found.length > 0) {
+          // Merge newly found items into reservations state
+          setReservations((prev) => {
+            const ids = new Set(prev.map((r) => r.reservation_id));
+            const fresh = found.filter((item) => !ids.has(item.reservation_id));
+            return [...fresh, ...prev];
+          });
+          setSelectedId(found[0].reservation_id);
+        }
+      }
+    } catch (err) {
+      console.error('[Search exception]', err);
+      const localMatches = reservations.filter((r) =>
+        r.reference_code.toUpperCase().includes(cleaned)
+      );
+      setQueriedResults(localMatches);
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
+  // Filter reservations matching search query or database query results
   const filteredReservations = useMemo(() => {
+    if (queriedResults !== null) {
+      return queriedResults;
+    }
     if (!cleanQuery) return reservations;
     return reservations.filter((r) =>
       r.reference_code.toUpperCase().includes(cleanQuery)
     );
-  }, [reservations, cleanQuery]);
+  }, [queriedResults, cleanQuery, reservations]);
 
   // Selected reservation details
   const selectedReservation = useMemo(() => {
@@ -198,20 +283,58 @@ export default function FindReservationView({ initialReservations }: FindReserva
         </div>
 
         {/* Lookup Input with # Prefix */}
-        <div className="relative">
-          <div className="absolute left-3.5 top-1/2 -translate-y-1/2 flex items-center gap-1.5 text-zinc-500 pointer-events-none">
-            <Search className="w-4 h-4" aria-hidden="true" />
-            <span className="font-mono font-bold text-amber-500">#</span>
+        <form onSubmit={handleSearch} className="flex flex-col sm:flex-row gap-3">
+          <div className="relative flex-1">
+            <div className="absolute left-3.5 top-1/2 -translate-y-1/2 flex items-center gap-1.5 text-zinc-500 pointer-events-none">
+              <Search className="w-4 h-4" aria-hidden="true" />
+              <span className="font-mono font-bold text-amber-500">#</span>
+            </div>
+            <input
+              id="find-reservation-input"
+              type="text"
+              value={searchQuery}
+              onChange={(e) => {
+                setSearchQuery(e.target.value);
+                setSearchMessage(null);
+                if (!e.target.value.trim()) {
+                  setQueriedResults(null);
+                  setHasSearched(false);
+                }
+              }}
+              placeholder="MS-2026-XXXXXX"
+              className="w-full pl-11 pr-4 py-3 rounded-xl bg-[#0E0F13] border border-[#23252E] text-white text-sm font-mono placeholder-zinc-600 focus:outline-none focus:border-amber-500 transition-colors uppercase"
+            />
           </div>
-          <input
-            id="find-reservation-input"
-            type="text"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="MS-2026-XXXXXX"
-            className="w-full pl-11 pr-4 py-3 rounded-xl bg-[#0E0F13] border border-[#23252E] text-white text-sm font-mono placeholder-zinc-600 focus:outline-none focus:border-amber-500 transition-colors uppercase"
-          />
-        </div>
+          <button
+            id="find-reservation-search-button"
+            type="submit"
+            disabled={isSearching}
+            className="px-6 py-3 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-black font-bold text-sm transition-colors cursor-pointer shrink-0 flex items-center justify-center gap-2 shadow-md"
+          >
+            {isSearching ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" />
+                <span>Searching...</span>
+              </>
+            ) : (
+              <>
+                <Search className="w-4 h-4" aria-hidden="true" />
+                <span>Search</span>
+              </>
+            )}
+          </button>
+        </form>
+
+        {/* Friendly message if query was empty */}
+        {searchMessage && (
+          <div
+            role="status"
+            className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs flex items-center gap-2 shadow-md"
+          >
+            <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" aria-hidden="true" />
+            <span>{searchMessage}</span>
+          </div>
+        )}
       </div>
 
       {/* Alert Notices */}
@@ -278,18 +401,23 @@ export default function FindReservationView({ initialReservations }: FindReserva
       )}
 
       {/* Main Content Area */}
-      {filteredReservations.length === 0 && cleanQuery ? (
+      {filteredReservations.length === 0 && (cleanQuery || hasSearched) ? (
         // Search Not Found Message
         <div className="bg-[#15161B] border border-[#23252E] rounded-2xl p-12 text-center flex flex-col items-center gap-3">
           <Ban className="w-8 h-8 text-zinc-500" aria-hidden="true" />
           <h3 className="text-lg font-bold text-white">No Reservation Found</h3>
           <p className="text-xs text-zinc-400 max-w-sm">
-            We couldn&apos;t find any booking matching <strong className="text-amber-400 font-mono">#{cleanQuery}</strong> in your account.
+            No reservation found for this code under your account.
           </p>
           <button
             type="button"
-            onClick={() => setSearchQuery('')}
-            className="mt-2 text-xs font-semibold text-amber-500 hover:text-amber-400 underline"
+            onClick={() => {
+              setSearchQuery('');
+              setQueriedResults(null);
+              setHasSearched(false);
+              setSearchMessage(null);
+            }}
+            className="mt-2 text-xs font-semibold text-amber-500 hover:text-amber-400 underline cursor-pointer"
           >
             Clear Search
           </button>
